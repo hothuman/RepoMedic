@@ -1,0 +1,114 @@
+name: RepoMedic CI and Windows package
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install core test dependency
+        run: python -m pip install 'packaging>=24,<27'
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+      - name: CLI and version check
+        shell: bash
+        run: |
+          python scripts/check_release.py
+          python cli.py . --format json --output repomedic-ci-report.json
+          python -c "import json; from version import __version__; assert json.load(open('repomedic-ci-report.json', encoding='utf-8'))['version'] == __version__"
+
+  windows-build:
+    name: Build Windows portable application
+    needs: tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install build tools
+        shell: pwsh
+        run: |
+          py -3.13 -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+      - name: GUI smoke test and PyInstaller build
+        shell: pwsh
+        run: .\scripts\build_windows.ps1
+        env:
+          QT_QPA_PLATFORM: offscreen
+      - name: Windows app launcher smoke test
+        shell: pwsh
+        run: .\scripts\smoke_exe.ps1
+        # On headless CI this only confirms the process stays alive briefly.
+        env:
+          QT_QPA_PLATFORM: offscreen
+      - name: Verify tag matches app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: .\.venv\Scripts\python.exe scripts\check_release.py --tag "$env:GITHUB_REF_NAME"
+      - name: Package portable ZIP and SHA-256
+        shell: pwsh
+        run: .\scripts\package_windows.ps1
+      - name: Archive CI build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: repomedic-windows-x64
+          path: |
+            release/*.zip
+            release/SHA256SUMS.txt
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    name: Publish GitHub Release after successful checks
+    needs: windows-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.13'
+      - name: Verify release tag
+        run: python scripts/check_release.py --tag "$GITHUB_REF_NAME"
+      - name: Download validated Windows build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: repomedic-windows-x64
+          path: release
+      - name: Publish binary and checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f release/SHA256SUMS.txt
+          (cd release && sha256sum --check SHA256SUMS.txt)
+          gh release create "$GITHUB_REF_NAME" release/*.zip release/SHA256SUMS.txt \
+            --verify-tag --title "RepoMedic $GITHUB_REF_NAME" --notes-file RELEASE_NOTES.md
